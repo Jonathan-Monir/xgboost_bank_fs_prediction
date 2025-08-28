@@ -1,3 +1,10 @@
+
+# Put these before heavy imports (best before importing xgboost)
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -27,37 +34,51 @@ def create_target_classes(y, n_classes=3):
     classes = np.clip(classes, 0, n_classes - 1)
     return classes
 
-def train_xgboost_model(df, random_seed=1471):
+def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True):
     """
-    Train XGBoost model with exact same approach as reference code
+    Train XGBoost with Streamlit-friendly defaults.
+    Returns: fold_results (list of dicts), summary_stats (dict), feature_importance (DataFrame), final_model (XGBRegressor)
     """
-    # Define feature columns and target (exactly as specified)
+    import time
+    from sklearn.model_selection import StratifiedKFold, KFold
+    from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+    # required minimal feature set (for CV training)
     feature_cols = ["hhis", "hhit", "ccr", "mcr", "ownership", "inflation", "bank_age"]
     target_col = "fs"
-    
-    # Check if required columns exist
-    missing_cols = [col for col in feature_cols + [target_col] if col not in df.columns]
-    if missing_cols:
-        st.error(f"Missing required columns: {missing_cols}")
+
+    # verify columns
+    missing = [c for c in feature_cols + [target_col] if c not in df.columns]
+    if missing:
+        st.error(f"Missing required columns: {missing}")
         st.error(f"Available columns: {list(df.columns)}")
         return None
-    
-    # Prepare features and target
+
+    # prepare X and y
     X = df[feature_cols].copy()
     y = df[target_col].copy()
-    
-    # Handle missing values if any
+
+    # handle missing values
     if X.isnull().sum().sum() > 0:
         X = X.fillna(X.median())
-        st.warning("Missing values found in features - filled with median values")
-    
+        if show_progress:
+            st.warning("Missing values found in features - filled with median values")
     if y.isnull().sum() > 0:
         mask = ~y.isnull()
-        X = X[mask]
-        y = y[mask]
-        st.warning(f"Missing values found in target - removed {(~mask).sum()} rows")
-    
-    # XGBoost hyperparameters - exactly as specified
+        removed = (~mask).sum()
+        X = X.loc[mask]
+        y = y.loc[mask]
+        if show_progress:
+            st.warning(f"Missing values found in target - removed {removed} rows")
+
+    # X_all for final feature importance. keep only existing columns
+    all_features = ["inflation", "hhis", "bank_age", "hhit", "hhic", "asset_size", "ownership", "ccr", "mcr", "hhig"]
+    all_features = [c for c in all_features if c in df.columns]
+    X_all = df[all_features].copy()
+    if X_all.isnull().sum().sum() > 0:
+        X_all = X_all.fillna(X_all.median())
+
+    # XGBoost params tuned for small/container environments
     param_dict = {
         'n_estimators': 55,
         'max_depth': 5,
@@ -67,90 +88,105 @@ def train_xgboost_model(df, random_seed=1471):
         'reg_alpha': 0.015,
         'reg_lambda': 1.5,
         'random_state': random_seed,
-        'n_jobs': -1
+        'n_jobs': cpu_threads,
+        'tree_method': 'hist',   # faster for CPU
+        'verbosity': 0
     }
-    
-    # Set numpy random seed
+
     np.random.seed(random_seed)
-    
-    # Create stratification classes for continuous target
-    y_classes = create_target_classes(y, n_classes=3)
-    
-    # Initialize Stratified K-Fold
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_seed)
-    
-    # Store results
+
+    # stratified classes for continuous y
+    try:
+        y_classes = create_target_classes(y, n_classes=3)
+    except Exception:
+        # fallback to simple binning if edge-case occurs
+        y_classes = pd.qcut(y.rank(method="first"), q=3, labels=False, duplicates='drop').astype(int)
+
+    # Initialize CV splitter; fallback to KFold if stratification is impossible
+    try:
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_seed)
+        splits = list(skf.split(X, y_classes))
+    except Exception:
+        kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
+        splits = list(kf.split(X))
+
     fold_results = []
     r2_scores = []
     rmse_scores = []
     mae_scores = []
     mse_scores = []
-    
-    # Get all features for feature importance
-#     all_features = [col for col in df.columns if col != target_col]
-    all_features = ["inflation", "hhis", "bank_age", "hhit", "hhic", "asset_size", "ownership", "ccr", "mcr", "hhig"]
-    X_all = df[all_features].copy()
-    if X_all.isnull().sum().sum() > 0:
-        X_all = X_all.fillna(X_all.median())
-    
-    # Perform cross-validation
-    fold_num = 0
-    for train_idx, test_idx in skf.split(X, y_classes):
-        fold_num += 1
-        
-        # Split data for training features
+
+    total_start = time.perf_counter()
+    for fold_num, (train_idx, test_idx) in enumerate(splits, start=1):
+        t0 = time.perf_counter()
+
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        
-        # Create XGBoost regressor
+
         xgb_model = xgb.XGBRegressor(**param_dict)
-        
-        # Fit model
+
+        # fit (silent). For small datasets verbose evaluation slows things; avoid eval_set here.
         xgb_model.fit(X_train, y_train)
-        
-        # Predict
+
         y_pred = xgb_model.predict(X_test)
-        
-        # Calculate metrics
+
         r2 = r2_score(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        mae = mean_absolute_error(y_test, y_pred)
         mse = mean_squared_error(y_test, y_pred)
-        
-        # Store results
+        rmse = np.sqrt(mse)
+        mae = mean_absolute_error(y_test, y_pred)
+
         r2_scores.append(r2)
         rmse_scores.append(rmse)
         mae_scores.append(mae)
         mse_scores.append(mse)
-        
+
         fold_results.append({
             'Fold': f'Fold {fold_num}',
-            'R²': r2,
-            'RMSE': rmse,
-            'MAE': mae,
-            'MSE': mse
+            'R²': float(r2),
+            'RMSE': float(rmse),
+            'MAE': float(mae),
+            'MSE': float(mse)
         })
-    
-    # Train final model on all data for feature importance (using all features)
-    final_model = xgb.XGBRegressor(n_estimators = 10, learning_rate=0.2)
-    final_model.fit(X_all[X_all.index.isin(X.index)], y)
-    
-    # Get feature importance
+
+        t1 = time.perf_counter()
+
+    total_time = time.perf_counter() - total_start
+
+    # final model on X_all for feature importance
+    # ensure indices align with y used in CV (use rows where target exists)
+    final_idx = y.index
+    X_all_for_fit = X_all.loc[final_idx] if not X_all.empty else X.loc[final_idx]
+    final_model = xgb.XGBRegressor(n_estimators=10, learning_rate=0.2,
+                                   tree_method='hist', n_jobs=cpu_threads, random_state=random_seed, verbosity=0)
+    final_model.fit(X_all_for_fit, y)
+
+    # feature importance (if X_all exists). if not, fallback to feature_cols
+    fi_features = all_features if all_features else feature_cols
+    importances = final_model.feature_importances_
+    # ensure length match
+    if len(importances) != len(fi_features):
+        # align available features
+        fi_features = [c for c in fi_features if c in X_all_for_fit.columns]
+        importances = final_model.feature_importances_[:len(fi_features)]
+
     feature_importance = pd.DataFrame({
-        'Feature': all_features,
-        'Importance': final_model.feature_importances_
-    }).sort_values('Importance', ascending=False)
-    
-    # Calculate summary statistics
+        'Feature': fi_features,
+        'Importance': importances
+    }).sort_values('Importance', ascending=False).reset_index(drop=True)
+
     summary_stats = {
-        'CV R² Mean': np.mean(r2_scores),
-        'CV R² Std': np.std(r2_scores),
-        'CV RMSE Mean': np.mean(rmse_scores),
-        'CV MAE Mean': np.mean(mae_scores),
-        'CV MSE Mean': np.mean(mse_scores)
+        'CV R² Mean': float(np.mean(r2_scores)),
+        'CV R² Std': float(np.std(r2_scores)),
+        'CV RMSE Mean': float(np.mean(rmse_scores)),
+        'CV MAE Mean': float(np.mean(mae_scores)),
+        'CV MSE Mean': float(np.mean(mse_scores))
     }
-    
+
     return fold_results, summary_stats, feature_importance, final_model
+
+@st.cache_data
+def load_csv(uploaded_file):
+    return pd.read_csv(uploaded_file)
 
 def main():
     st.title("XGBoost Model Training Dashboard")
@@ -167,7 +203,7 @@ def main():
     if uploaded_file is not None:
         try:
             # Load data
-            df = pd.read_csv(uploaded_file)
+            df = load_csv(uploaded_file)
             
             # Display basic info about the dataset
             col1, col2, col3 = st.columns(3)
