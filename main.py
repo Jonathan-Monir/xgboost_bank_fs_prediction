@@ -15,7 +15,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
 warnings.filterwarnings('ignore')
-
+import seaborn as sns
+import matplotlib.pyplot as plt
 # Try to import SHAP
 try:
     import shap
@@ -29,6 +30,338 @@ st.set_page_config(
     layout="wide"
 )
 
+def add_mse_trees_analysis_to_main():
+    """
+    Add this function to your main() function after the training section.
+    This creates the MSE vs Trees analysis interface.
+    """
+    # Add this after your existing training section in main()
+    
+    # MSE vs Trees Analysis
+    st.markdown("---")
+    st.header("📈 MSE vs Number of Trees Analysis")
+    st.write("Analyze how MSE changes with the number of trees to detect overfitting and find optimal tree count.")
+    
+    # Controls for the analysis
+    col1, col2 = st.columns(2)
+    with col1:
+        max_trees = 80
+
+
+    if st.button("🔍 Analyze MSE vs Trees", type="secondary"):
+        if 'df' not in st.session_state:
+            st.error("Please train a model first or upload data.")
+        else:
+            # Run the analysis
+            result = create_mse_vs_trees_plot(
+                st.session_state.df, 
+                random_seed=1471, 
+                cpu_threads=1, 
+                max_trees=max_trees
+            )
+            
+            if result[0] is not None:
+                fig, tree_counts, train_mse, cv_mse = result
+                
+                # Display the plot
+                st.plotly_chart(fig, use_container_width=True)
+                
+                
+                
+                # Data download
+                st.subheader("💾 Download Analysis Data")
+                analysis_df = pd.DataFrame({
+                    'Trees': tree_counts,
+                    'Training_MSE': train_mse,
+                    'CV_MSE': cv_mse
+                })
+                
+                csv_data = analysis_df.to_csv(index=False)
+                st.download_button(
+                    "📥 Download MSE vs Trees Data",
+                    csv_data,
+                    "mse_vs_trees_analysis.csv",
+                    "text/csv",
+                    help="Download the MSE values for different tree counts"
+                )
+                
+                # Show data preview
+
+def create_mse_vs_trees_plot(df, random_seed=1471, cpu_threads=1, max_trees=100):
+    """
+    Create a line plot showing MSE vs number of trees for training and cross-validation.
+    Returns training and CV MSE at different tree counts.
+    """
+    import numpy as np
+    import pandas as pd
+    import xgboost as xgb
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.metrics import mean_squared_error
+    import plotly.graph_objects as go
+    import streamlit as st
+    
+    # Required feature set
+    feature_cols = ["hhis", "hhit", "ccr", "mcr", "ownership", "inflation", "bank_age"]
+    target_col = "fs"
+    
+    # Verify columns
+    missing = [c for c in feature_cols + [target_col] if c not in df.columns]
+    if missing:
+        st.error(f"Missing required columns: {missing}")
+        return None, None, None
+    
+    # Prepare data
+    X = df[feature_cols].copy()
+    y = df[target_col].copy()
+    
+    # Handle missing values
+    if X.isnull().sum().sum() > 0:
+        X = X.fillna(X.median())
+    if y.isnull().sum() > 0:
+        mask = ~y.isnull()
+        X = X.loc[mask]
+        y = y.loc[mask]
+    
+    np.random.seed(random_seed)
+    
+    # Create stratified classes for CV
+    try:
+        y_classes = create_target_classes(y, n_classes=3)
+    except Exception:
+        y_classes = pd.qcut(y.rank(method="first"), q=3, labels=False, duplicates='drop').astype(int)
+    
+    # XGBoost parameters (adjusted for evaluation)
+    param_dict = {
+        'max_depth': 5,
+        'learning_rate': 0.1,
+        'subsample': 0.45,
+        'colsample_bytree': 0.5,
+        'reg_alpha': 0.015,
+        'reg_lambda': 1.5,
+        'random_state': random_seed,
+        'n_jobs': cpu_threads,
+        'tree_method': 'hist',
+        'verbosity': 0
+    }
+    
+    # Initialize CV splitter
+    try:
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_seed)
+        splits = list(skf.split(X, y_classes))
+    except Exception:
+        from sklearn.model_selection import KFold
+        kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
+        splits = list(kf.split(X))
+    
+    # Store MSE values for each tree count
+    tree_counts = list(range(1, max_trees + 1, 5))  # Every 5 trees
+    cv_mse_by_trees = []
+    train_mse_by_trees = []
+    
+    with st.spinner(f"Evaluating MSE for different tree counts (up to {max_trees} trees)..."):
+        progress_bar = st.progress(0)
+        
+        for i, n_trees in enumerate(tree_counts):
+            # Cross-validation MSE
+            cv_mse_scores = []
+            train_mse_scores = []
+            
+            for train_idx, test_idx in splits:
+                X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+                y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+                
+                # Train model with current number of trees
+                model = xgb.XGBRegressor(n_estimators=n_trees, **param_dict)
+                model.fit(X_train, y_train)
+                
+                # Predictions
+                y_pred_test = model.predict(X_test)
+                y_pred_train = model.predict(X_train)
+                
+                # Calculate MSE
+                cv_mse = mean_squared_error(y_test, y_pred_test)
+                train_mse = mean_squared_error(y_train, y_pred_train)
+                
+                cv_mse_scores.append(cv_mse)
+                train_mse_scores.append(train_mse)
+            
+            # Store average MSE across folds
+            cv_mse_by_trees.append(np.mean(cv_mse_scores))
+            train_mse_by_trees.append(np.mean(train_mse_scores))
+            
+            # Update progress
+            progress_bar.progress((i + 1) / len(tree_counts))
+        
+        progress_bar.empty()
+    
+    # Create the plot
+    fig = go.Figure()
+    
+    # Add training MSE line (blue)
+    fig.add_trace(go.Scatter(
+        x=tree_counts,
+        y=train_mse_by_trees,
+        mode='lines+markers',
+        name='Training MSE',
+        line=dict(color='blue', width=2),
+        marker=dict(size=6, color='blue')
+    ))
+    
+    # Add cross-validation MSE line (orange)
+    fig.add_trace(go.Scatter(
+        x=tree_counts,
+        y=cv_mse_by_trees,
+        mode='lines+markers',
+        name='Cross-Validation MSE',
+        line=dict(color='orange', width=2),
+        marker=dict(size=6, color='orange')
+    ))
+    
+    # Update layout
+    fig.update_layout(
+        title='MSE vs Number of Trees (Training vs Cross-Validation)',
+        xaxis_title='Number of Trees',
+        yaxis_title='Mean Squared Error (MSE)',
+        width=800,
+        height=500,
+        hovermode='x unified',
+        legend=dict(
+            yanchor="top",
+            y=0.99,
+            xanchor="right",
+            x=0.99
+        ),
+#         grid=True
+    )
+    
+    # Add grid
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='lightgray')
+    
+    return fig, tree_counts, train_mse_by_trees, cv_mse_by_trees
+
+def create_correlation_heatmap(df):
+    """Create correlation matrix heatmap for all variables"""
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    st.subheader("🔗 Variable Correlation Matrix")
+    
+    # Select only numeric columns
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    
+    # Remove non-relevant columns if they exist
+    exclude_cols = ['bank_no', 'year'] if any(col in numeric_cols for col in ['bank_no', 'year']) else []
+    numeric_cols = [col for col in numeric_cols if col not in exclude_cols]
+    
+    if len(numeric_cols) < 2:
+        st.warning("Not enough numeric variables to create correlation matrix")
+        return
+    
+    # Calculate correlation matrix
+    corr_matrix = df[numeric_cols].corr()
+    
+    # Create mask for upper triangle (to show only lower triangle)
+    mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
+    
+    # Create the plot using matplotlib and seaborn
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Create heatmap
+#     sns.heatmap(corr_matrix, 
+#                 mask=mask, 
+#                 annot=True, 
+#                 cmap='RdBu_r', 
+#                 center=0,
+#                 square=True, 
+#                 linewidths=0.5, 
+#                 cbar_kws={"shrink": 0.5},
+#                 fmt='.3f',
+#                 ax=ax)
+    
+#     plt.title('Correlation Matrix Heatmap', fontsize=16, pad=20)
+#     plt.tight_layout()
+    
+    # Display in Streamlit
+#     st.pyplot(fig)
+    
+    # Also create interactive plotly version
+#     st.subheader("🔗 Interactive Correlation Matrix")
+    
+    # Prepare data for plotly heatmap
+    corr_values = corr_matrix.values
+    # Apply mask to correlation values
+    corr_values_masked = np.where(mask, np.nan, corr_values)
+    
+    fig_plotly = go.Figure(data=go.Heatmap(
+        z=corr_values_masked,
+        x=corr_matrix.columns,
+        y=corr_matrix.columns,
+        colorscale='RdBu',
+        zmid=0,
+        text=np.round(corr_values_masked, 3),
+        texttemplate="%{text}",
+        textfont={"size": 10},
+        hoverongaps=False,
+        showscale=True
+    ))
+    
+    fig_plotly.update_layout(
+        title='Interactive Correlation Matrix',
+        xaxis_title='Variables',
+        yaxis_title='Variables',
+        height=600,
+        width=800
+    )
+    
+    st.plotly_chart(fig_plotly, use_container_width=True)
+    
+    # Show strongest correlations
+    st.subheader("📊 Strongest Correlations")
+    
+    # Get correlation pairs (excluding self-correlations)
+    corr_pairs = []
+    for i in range(len(corr_matrix.columns)):
+        for j in range(i+1, len(corr_matrix.columns)):
+            corr_pairs.append({
+                'Variable 1': corr_matrix.columns[i],
+                'Variable 2': corr_matrix.columns[j],
+                'Correlation': corr_matrix.iloc[i, j],
+                'Abs Correlation': abs(corr_matrix.iloc[i, j])
+            })
+    
+    # Convert to DataFrame and sort by absolute correlation
+    corr_df = pd.DataFrame(corr_pairs).sort_values('Abs Correlation', ascending=False)
+    
+    # Display top correlations
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Strongest Positive Correlations:**")
+        positive_corr = corr_df[corr_df['Correlation'] > 0].head(10)
+        positive_display = positive_corr[['Variable 1', 'Variable 2', 'Correlation']].copy()
+        positive_display['Correlation'] = positive_display['Correlation'].apply(lambda x: f"{x:.3f}")
+        st.dataframe(positive_display, hide_index=True, use_container_width=True)
+    
+    with col2:
+        st.write("**Strongest Negative Correlations:**")
+        negative_corr = corr_df[corr_df['Correlation'] < 0].head(10)
+        negative_display = negative_corr[['Variable 1', 'Variable 2', 'Correlation']].copy()
+        negative_display['Correlation'] = negative_display['Correlation'].apply(lambda x: f"{x:.3f}")
+        st.dataframe(negative_display, hide_index=True, use_container_width=True)
+    
+    # Download correlation matrix
+    csv_corr = corr_matrix.to_csv()
+    st.download_button(
+        "📥 Download Correlation Matrix",
+        csv_corr,
+        "correlation_matrix.csv",
+        "text/csv",
+        help="Download the complete correlation matrix as CSV"
+    )
+    
+    return corr_matrix
 def create_target_classes(y, n_classes=3):
     """
     Convert continuous target to classes for stratified sampling.
@@ -438,6 +771,16 @@ def main():
                         
                         st.dataframe(fold_df_display, use_container_width=True, hide_index=True)
                         
+#                         with st.expander("📋 Dataset Preview", expanded=False):
+#                             st.dataframe(df.head(10))
+
+# ADD THE CORRELATION HEATMAP HERE:
+                        st.markdown("---")
+                        create_correlation_heatmap(df)
+
+# Training section (existing code continues...)
+                        st.markdown("---")
+                        st.header("Model Training")
                         # Feature importance
 #                         st.subheader("🎯 Feature Importance")
 #                         
@@ -557,6 +900,9 @@ def main():
                                 "text/csv"
                             )
             
+
+            add_mse_trees_analysis_to_main()
+
             # Prediction interface (only show if model is trained)
             if 'training_model' in st.session_state:
                 st.markdown("---")
