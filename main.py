@@ -635,8 +635,7 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
 
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        y_std = np.std(y_test)
-
+        # (do NOT compute y std per fold; we want std of R² across folds)
         xgb_model = xgb.XGBRegressor(**param_dict)
 
         # fit (silent). For small datasets verbose evaluation slows things; avoid eval_set here.
@@ -650,14 +649,15 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
         mae = mean_absolute_error(y_test, y_pred)
         mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
 
+        # collect fold-level metrics (no per-fold 'Std' of y)
         r2_scores.append(r2)
         rmse_scores.append(rmse)
         mae_scores.append(mae)
         mse_scores.append(mse)
         mape_scores = mape_scores if 'mape_scores' in locals() else []
         mape_scores.append(mape)
-        std_scores.append(y_std)
 
+        # For fold-wise rows keep 'Std' blank (we'll show R² std only in the summary / Mean row)
         fold_results.append({
             'Fold': fold_num,
             'R²': float(r2),
@@ -665,7 +665,7 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
             'MAE': float(mae),
             'MSE': float(mse),
             'MAPE (%)': float(mape),
-            'Std': float(y_std)
+            'Std': ""   # empty for individual folds
         })
 
         t1 = time.perf_counter()
@@ -697,22 +697,38 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
         'Importance': importances
     }).sort_values('Importance', ascending=False).reset_index(drop=True)
 
+    # compute means
+    r2_mean = float(np.mean(r2_scores))
+    rmse_mean = float(np.mean(rmse_scores))
+    mae_mean = float(np.mean(mae_scores))
+    mse_mean = float(np.mean(mse_scores))
+    mape_mean = float(np.mean(mape_scores))
+
+    # Compute std of R² across folds (sample std). If only 1 fold, fallback to 0.0
+    if len(r2_scores) > 1:
+        r2_std = float(np.std(r2_scores, ddof=1))
+    else:
+        r2_std = 0.0
+
+    # Append mean row (showing R² std in the 'Std' column)
     fold_results.append({
         'Fold': 'Mean',
-        'R²': float(np.mean(r2_scores)),
-        'RMSE': float(np.mean(rmse_scores)),
-        'MAE': float(np.mean(mae_scores)),
-        'MSE': float(np.mean(mse_scores)),
-        'MAPE (%)': float(np.mean(mape_scores)),
-        'Std': float(np.mean(std_scores))
+        'R²': r2_mean,
+        'RMSE': rmse_mean,
+        'MAE': mae_mean,
+        'MSE': mse_mean,
+        'MAPE (%)': mape_mean,
+        'Std': float(r2_std)
     })
 
+    # Include R² std in summary_stats
     summary_stats = {
-        'CV R² Mean': float(np.mean(r2_scores)),
-        'CV RMSE Mean': float(np.mean(rmse_scores)),
-        'CV MAE Mean': float(np.mean(mae_scores)),
-        'CV MSE Mean': float(np.mean(mse_scores)),
-        'CV MAPE Mean': float(np.mean(mape_scores)),
+        'CV R² Mean': r2_mean,
+        'CV R² Std': float(r2_std),
+        'CV RMSE Mean': rmse_mean,
+        'CV MAE Mean': mae_mean,
+        'CV MSE Mean': mse_mean,
+        'CV MAPE Mean': mape_mean,
     }
 
     return fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_fit
@@ -926,6 +942,8 @@ def main():
                             st.metric("MAE Mean", f"{summary_stats['CV MAE Mean']:.4f}")
                             st.metric("MSE Mean", f"{summary_stats['CV MSE Mean']:.4f}")
                         with col3:
+                            # show R² standard deviation here (new)
+                            st.metric("R² Std", f"{summary_stats['CV R² Std']:.6f}")
                             st.metric("MAPE Mean", f"{summary_stats['CV MAPE Mean']:.4f}%")
                         
                         # Fold-wise results table
