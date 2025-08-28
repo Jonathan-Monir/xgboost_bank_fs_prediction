@@ -1,4 +1,3 @@
-
 # Put these before heavy imports (best before importing xgboost)
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -16,6 +15,13 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import warnings
 warnings.filterwarnings('ignore')
+
+# Try to import SHAP
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
 
 st.set_page_config(
     page_title="XGBoost Model Training",
@@ -37,7 +43,7 @@ def create_target_classes(y, n_classes=3):
 def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True):
     """
     Train XGBoost with Streamlit-friendly defaults.
-    Returns: fold_results (list of dicts), summary_stats (dict), feature_importance (DataFrame), final_model (XGBRegressor)
+    Returns: fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_shap
     """
     import time
     from sklearn.model_selection import StratifiedKFold, KFold
@@ -115,6 +121,8 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
     rmse_scores = []
     mae_scores = []
     mse_scores = []
+    mape_scores = []
+    std_scores = []
 
     total_start = time.perf_counter()
     for fold_num, (train_idx, test_idx) in enumerate(splits, start=1):
@@ -122,6 +130,7 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
 
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        y_std = np.std(y_test)
 
         xgb_model = xgb.XGBRegressor(**param_dict)
 
@@ -134,30 +143,39 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
         mse = mean_squared_error(y_test, y_pred)
         rmse = np.sqrt(mse)
         mae = mean_absolute_error(y_test, y_pred)
+        mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
 
         r2_scores.append(r2)
         rmse_scores.append(rmse)
         mae_scores.append(mae)
         mse_scores.append(mse)
+        mape_scores = mape_scores if 'mape_scores' in locals() else []
+        mape_scores.append(mape)
+        std_scores.append(y_std)
 
         fold_results.append({
-            'Fold': f'Fold {fold_num}',
+            'Fold': fold_num,
             'R²': float(r2),
             'RMSE': float(rmse),
             'MAE': float(mae),
-            'MSE': float(mse)
+            'MSE': float(mse),
+            'MAPE (%)': float(mape),
+            'Std': float(y_std)
         })
 
         t1 = time.perf_counter()
 
     total_time = time.perf_counter() - total_start
 
-    # final model on X_all for feature importance
+    # Training model on feature_cols for predictions
+    training_model = xgb.XGBRegressor(**param_dict)
+    training_model.fit(X, y)
+
+    # final model on X_all for feature importance and SHAP
     # ensure indices align with y used in CV (use rows where target exists)
     final_idx = y.index
     X_all_for_fit = X_all.loc[final_idx] if not X_all.empty else X.loc[final_idx]
-    final_model = xgb.XGBRegressor(n_estimators=10, learning_rate=0.2,
-                                   tree_method='hist', n_jobs=cpu_threads, random_state=random_seed, verbosity=0)
+    final_model = xgb.XGBRegressor(**param_dict)
     final_model.fit(X_all_for_fit, y)
 
     # feature importance (if X_all exists). if not, fallback to feature_cols
@@ -174,19 +192,173 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
         'Importance': importances
     }).sort_values('Importance', ascending=False).reset_index(drop=True)
 
+    fold_results.append({
+        'Fold': 'Mean',
+        'R²': float(np.mean(r2_scores)),
+        'RMSE': float(np.mean(rmse_scores)),
+        'MAE': float(np.mean(mae_scores)),
+        'MSE': float(np.mean(mse_scores)),
+        'MAPE (%)': float(np.mean(mape_scores)),
+        'Std': float(np.mean(std_scores))
+    })
+
     summary_stats = {
         'CV R² Mean': float(np.mean(r2_scores)),
-        'CV R² Std': float(np.std(r2_scores)),
         'CV RMSE Mean': float(np.mean(rmse_scores)),
         'CV MAE Mean': float(np.mean(mae_scores)),
-        'CV MSE Mean': float(np.mean(mse_scores))
+        'CV MSE Mean': float(np.mean(mse_scores)),
+        'CV MAPE Mean': float(np.mean(mape_scores)),
     }
 
-    return fold_results, summary_stats, feature_importance, final_model
+    return fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_fit
+
+def create_shap_plots(model, X_sample, feature_names):
+    """Create SHAP plots for model interpretation"""
+    if not SHAP_AVAILABLE:
+        st.warning("SHAP is not available. Please install it using: pip install shap")
+        return None, None, None
+    
+    try:
+        # Create SHAP explainer
+        explainer = shap.TreeExplainer(model)
+        
+        # Calculate SHAP values for sample
+        shap_values = explainer.shap_values(X_sample)
+        
+        # Summary plot data
+        shap_summary = pd.DataFrame({
+            'Feature': feature_names,
+            'Mean_SHAP': np.abs(shap_values).mean(axis=0)
+        }).sort_values('Mean_SHAP', ascending=False)
+        
+        return explainer, shap_values, shap_summary
+    except Exception as e:
+        st.error(f"Error creating SHAP analysis: {str(e)}")
+        return None, None, None
+
+def create_prediction_interface(training_model, df, feature_cols):
+    """Create interface for user input predictions"""
+    st.subheader("🎯 Make Predictions")
+    st.write("Enter values for all columns to predict the financial soundness (fs) score:")
+    
+    # Get column statistics for input validation
+    stats = df.describe()
+    
+    # Create input fields for all columns
+    user_inputs = {}
+    
+    # Organize inputs in columns
+    input_cols = st.columns(3)
+    all_columns = [col for col in df.columns if col != 'fs']
+    all_columns = [col for col in all_columns if col != 'year']
+    
+    for i, col in enumerate(all_columns):
+        if col == "bank_no" or col=="year":
+            continue
+        if col == "bank_age":
+            i = 9
+        with input_cols[i % 3]:
+            if col in stats.columns:
+                min_val = float(stats.loc['min', col])
+                max_val = float(stats.loc['max', col])
+                mean_val = float(stats.loc['mean', col])
+                
+                user_inputs[col] = st.number_input(
+                    f"{col}",
+                    min_value=min_val,
+                    max_value=max_val,
+                    value=mean_val,
+                    step=(max_val - min_val) / 100,
+                    help=f"Range: {min_val:.3f} to {max_val:.3f}"
+                )
+            else:
+                user_inputs[col] = st.number_input(f"{col}", value=0.0)
+    
+    # Predict button
+    if st.button("🚀 Predict FS Score", type="primary"):
+        # Create input dataframe with only the training features
+        input_df = pd.DataFrame([user_inputs])
+        prediction_input = input_df[feature_cols]
+        
+        # Make prediction
+        prediction = training_model.predict(prediction_input)[0]
+        
+        # Display prediction
+        st.success(f"**Predicted Financial Soundness (FS) Score: {prediction:.4f}**")
+        
+
+def create_csv_predictions(training_model, df, feature_cols):
+    """Create predictions for all rows in the dataset"""
+    st.subheader("📊 Dataset Predictions")
+    
+    # Check if target column exists
+    if 'fs' not in df.columns:
+        st.warning("Target column 'fs' not found. Only predictions will be shown.")
+        has_target = False
+    else:
+        has_target = True
+    
+    # Prepare prediction input
+    prediction_input = df[feature_cols].fillna(df[feature_cols].median())
+    
+    # Make predictions
+    predictions = training_model.predict(prediction_input)
+    
+    # Create results dataframe
+    results_df = df.copy()
+    results_df['predicted_fs'] = predictions
+    
+    if has_target:
+        results_df['fs_difference'] = results_df['fs'] - results_df['predicted_fs']
+        results_df['absolute_difference'] = np.abs(results_df['fs_difference'])
+        
+        # Calculate metrics
+        actual_fs = results_df['fs'].dropna()
+        pred_fs = results_df.loc[actual_fs.index, 'predicted_fs']
+        
+        r2 = r2_score(actual_fs, pred_fs)
+        rmse = np.sqrt(mean_squared_error(actual_fs, pred_fs))
+        mae = mean_absolute_error(actual_fs, pred_fs)
+        
+        # Display metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("R² Score", f"{r2:.6f}")
+        with col2:
+            st.metric("RMSE", f"{rmse:.4f}")
+        with col3:
+            st.metric("MAE", f"{mae:.4f}")
+    
+    # Display preview
+    st.write("**Dataset with Predictions:**")
+    
+    # Show relevant columns
+    if has_target:
+        display_cols = ['fs', 'predicted_fs', 'fs_difference', 'absolute_difference'] + feature_cols
+    else:
+        display_cols = ['predicted_fs'] + feature_cols
+    
+    preview_df = results_df[display_cols].head(10)
+    st.dataframe(preview_df, use_container_width=True)
+    
+    # Download button
+    csv_data = results_df.to_csv(index=False)
+    st.download_button(
+        "📥 Download Full Predictions CSV",
+        csv_data,
+        "predictions_with_differences.csv",
+        "text/csv",
+        help="Download the complete dataset with predictions and differences"
+    )
+    
+    return results_df
 
 @st.cache_data
-def load_csv(uploaded_file):
-    return pd.read_csv(uploaded_file)
+def load_data(uploaded_file):
+    if uploaded_file.name.endswith('.csv'):
+        return pd.read_csv(uploaded_file)
+    else:  # Excel files
+        return pd.read_excel(uploaded_file)
 
 def main():
     st.title("XGBoost Model Training Dashboard")
@@ -195,15 +367,15 @@ def main():
     # Sidebar for file upload
     st.sidebar.header("📁 Upload Data")
     uploaded_file = st.sidebar.file_uploader(
-        "Choose a CSV file",
-        type="csv",
-        help="Upload your CSV file containing the training data"
+        "Choose a CSV or Excel file",
+        type=["csv", "xlsx", "xls"],
+        help="Upload your CSV or Excel file containing the training data"
     )
     
     if uploaded_file is not None:
         try:
             # Load data
-            df = load_csv(uploaded_file)
+            df = load_data(uploaded_file)
             
             # Display basic info about the dataset
             col1, col2, col3 = st.columns(3)
@@ -218,66 +390,38 @@ def main():
             with st.expander("📋 Dataset Preview", expanded=False):
                 st.dataframe(df.head(10))
             
-            # Show dataset info
-#             with st.expander("ℹ️ Dataset Information"):
-#                 col1, col2 = st.columns(2)
-#                 with col1:
-#                     st.subheader("Column Data Types")
-#                     st.write(df.dtypes.to_frame('Data Type'))
-#                 with col2:
-#                     st.subheader("Missing Values")
-#                     missing_df = pd.DataFrame({
-#                         'Missing Count': df.isnull().sum(),
-#                         'Missing %': (df.isnull().sum() / len(df) * 100).round(2)
-#                     })
-#                     st.write(missing_df[missing_df['Missing Count'] > 0])
-            
             # Training section
             st.markdown("---")
             st.header("Model Training")
             
-#             # Show training configuration
-#             with st.expander("⚙️ Training Configuration", expanded=True):
-#                 col1, col2 = st.columns(2)
-#                 with col1:
-#                     st.write("**Training Features:**")
-#                     st.code(["hhis", "hhit", "ccr", "mcr", "ownership", "inflation", "bank_age"])
-#                     st.write("**Target Variable:** fs")
-#                     st.write("**Cross-Validation:** 5-Fold Stratified")
-#                 with col2:
-#                     st.write("**XGBoost Parameters:**")
-#                     st.code("""n_estimators: 55
-# max_depth: 5
-# learning_rate: 0.1
-# subsample: 0.45
-# colsample_bytree: 0.5
-# reg_alpha: 0.015
-# reg_lambda: 1.5
-# random_state: 1471""")
-            
             # Train button
-            if st.button("Use XGBoost Model", type="primary"):
+            if st.button("🚀 Train XGBoost Model", type="primary"):
                 with st.spinner("Training XGBoost model..."):
                     results = train_xgboost_model(df, random_seed=1471)
                     
                     if results is not None:
-                        fold_results, summary_stats, feature_importance, final_model = results
+                        fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_shap = results
+                        
+                        # Store models in session state for later use
+                        st.session_state.training_model = training_model
+                        st.session_state.final_model = final_model
+                        st.session_state.X_all_for_shap = X_all_for_shap
+                        st.session_state.df = df
+                        st.session_state.feature_cols = ["hhis", "hhit", "ccr", "mcr", "ownership", "inflation", "bank_age"]
                         
                         # Display results
                         
                         # Summary metrics
                         st.subheader("📊 Cross-Validation Summary")
-                        col1, col2, col3, col4, col5 = st.columns(5)
+                        col1, col2, col3 = st.columns(3)
                         with col1:
                             st.metric("R² Mean", f"{summary_stats['CV R² Mean']:.6f}")
-                        with col2:
-                            st.metric("R² Std", f"{summary_stats['CV R² Std']:.5f}")
-                        with col3:
                             st.metric("RMSE Mean", f"{summary_stats['CV RMSE Mean']:.4f}")
-                        with col4:
+                        with col2:
                             st.metric("MAE Mean", f"{summary_stats['CV MAE Mean']:.4f}")
-                        with col5:
                             st.metric("MSE Mean", f"{summary_stats['CV MSE Mean']:.4f}")
+                        with col3:
+                            st.metric("MAPE Mean", f"{summary_stats['CV MAPE Mean']:.4f}%")
                         
                         # Fold-wise results table
                         st.subheader("📋 Fold-wise Results")
@@ -285,37 +429,76 @@ def main():
                         
                         # Format the dataframe for better display
                         fold_df_display = fold_df.copy()
-                        fold_df_display['R²'] = fold_df_display['R²'].apply(lambda x: f"{x:.6f}")
-                        fold_df_display['RMSE'] = fold_df_display['RMSE'].apply(lambda x: f"{x:.4f}")
-                        fold_df_display['MAE'] = fold_df_display['MAE'].apply(lambda x: f"{x:.4f}")
-                        fold_df_display['MSE'] = fold_df_display['MSE'].apply(lambda x: f"{x:.4f}")
+                        fold_df_display['R²'] = fold_df_display['R²'].apply(lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x)
+                        fold_df_display['RMSE'] = fold_df_display['RMSE'].apply(lambda x: f"{x:.4f}" if isinstance(x, (int, float)) else x)
+                        fold_df_display['MAE'] = fold_df_display['MAE'].apply(lambda x: f"{x:.4f}" if isinstance(x, (int, float)) else x)
+                        fold_df_display['MSE'] = fold_df_display['MSE'].apply(lambda x: f"{x:.4f}" if isinstance(x, (int, float)) else x)
+                        fold_df_display['MAPE (%)'] = fold_df_display['MAPE (%)'].apply(lambda x: f"{x:.4f}%" if isinstance(x, (int, float)) else x)
+                        fold_df_display['Std'] = fold_df_display['Std'].apply(lambda x: f"{x:.4f}" if isinstance(x, (int, float)) else x)
                         
-                        st.dataframe(fold_df_display, use_container_width=True)
+                        st.dataframe(fold_df_display, use_container_width=True, hide_index=True)
                         
                         # Feature importance
-                        st.subheader("Feature Importance")
+#                         st.subheader("🎯 Feature Importance")
+#                         
+#                         col1, col2 = st.columns([2, 1])
+#                         
+#                         with col1:
+#                             # Feature importance plot
+#                             fig = px.bar(
+#                                 feature_importance.head(15), 
+#                                 x='Importance', 
+#                                 y='Feature',
+#                                 orientation='h',
+#                                 title="Top Feature Importance",
+#                                 color='Importance',
+#                                 color_continuous_scale='viridis'
+#                             )
+#                             fig.update_layout(height=600, yaxis={'categoryorder':'total ascending'})
+#                             st.plotly_chart(fig, use_container_width=True)
+#                         
+#                         with col2:
+#                             st.write("**Top Features:**")
+#                             top_features = feature_importance.head(10).copy()
+#                             top_features['Importance'] = top_features['Importance'].apply(lambda x: f"{x:.4f}")
+#                             st.dataframe(top_features, use_container_width=True, hide_index=True)
                         
-                        col1, col2 = st.columns([2, 1])
-                        
-                        with col1:
-                            # Feature importance plot
-                            fig = px.bar(
-                                feature_importance.head(15), 
-                                x='Importance', 
-                                y='Feature',
-                                orientation='h',
-                                title="Top Feature Importance",
-                                color='Importance',
-                                color_continuous_scale='viridis'
-                            )
-                            fig.update_layout(height=600, yaxis={'categoryorder':'total ascending'})
-                            st.plotly_chart(fig, use_container_width=True)
-                        
-                        with col2:
-                            st.write("**Top Features:**")
-                            top_features = feature_importance.head(10).copy()
-                            top_features['Importance'] = top_features['Importance'].apply(lambda x: f"{x:.4f}")
-                            st.dataframe(top_features, use_container_width=True, hide_index=True)
+                        # SHAP Analysis
+                        if SHAP_AVAILABLE:
+                            st.subheader("🔍 SHAP Analysis")
+                            with st.spinner("Generating SHAP insights..."):
+                                explainer, shap_values, shap_summary = create_shap_plots(
+                                    final_model, 
+                                    X_all_for_shap.head(50),  # Use sample for performance
+                                    X_all_for_shap.columns.tolist()
+                                )
+                                
+                                if shap_summary is not None:
+                                    col1, col2 = st.columns([2, 1])
+                                    
+                                    with col1:
+                                        # SHAP summary plot
+                                        fig_shap = px.bar(
+                                            shap_summary.head(15),
+                                            x='Mean_SHAP',
+                                            y='Feature',
+                                            orientation='h',
+                                            title="SHAP Feature Impact (Mean Absolute SHAP Values)",
+                                            color='Mean_SHAP',
+                                            color_continuous_scale='plasma'
+                                        )
+                                        fig_shap.update_layout(height=600, yaxis={'categoryorder':'total ascending'})
+                                        st.plotly_chart(fig_shap, use_container_width=True)
+                                    
+                                    with col2:
+                                        st.write("**SHAP Impact Ranking:**")
+                                        shap_display = shap_summary.head(10).copy()
+                                        shap_display['Mean_SHAP'] = shap_display['Mean_SHAP'].apply(lambda x: f"{x:.4f}")
+                                        st.dataframe(shap_display, use_container_width=True, hide_index=True)
+                                        
+                                        st.info("SHAP values show how much each feature contributes to individual predictions, providing more detailed insights than traditional feature importance.")
+                        else:
+                            st.warning("⚠️ SHAP is not available. Install it with: `pip install shap` to get detailed model interpretability insights.")
                         
                         # Performance visualization
                         st.subheader("📈 Performance Visualization")
@@ -373,6 +556,22 @@ def main():
                                 "feature_importance.csv",
                                 "text/csv"
                             )
+            
+            # Prediction interface (only show if model is trained)
+            if 'training_model' in st.session_state:
+                st.markdown("---")
+                create_prediction_interface(
+                    st.session_state.training_model, 
+                    st.session_state.df,
+                    st.session_state.feature_cols
+                )
+                
+                st.markdown("---")
+                create_csv_predictions(
+                    st.session_state.training_model, 
+                    st.session_state.df,
+                    st.session_state.feature_cols
+                )
                     
         except Exception as e:
             st.error(f"Error loading data: {str(e)}")
@@ -386,30 +585,44 @@ def main():
         ### 📋 Requirements
         Your CSV file should contain the following columns:
         
-        **Training Features:**
-        - `hhis` - Feature 1
-        - `hhit` - Feature 2  
-        - `ccr` - Feature 3
-        - `mcr` - Feature 4
-        - `ownership` - Feature 5
-        - `inflation` - Feature 6
-        - `bank_age` - Feature 7
         
         **Target Variable:**
         - `fs` - Target variable (continuous)
         
-        ### ⚙️ Model Configuration
-        - **Algorithm:** XGBoost Regressor
-        - **Cross-Validation:** 5-Fold Stratified
-        - **Random State:** 1471 (for reproducibility)
-        - **Feature Importance:** Calculated on all available features
         
-        ### 📊 Output Metrics
-        The app will provide:
-        - Cross-validation R², RMSE, MAE, MSE (mean and std)
-        - Fold-wise performance metrics
-        - Feature importance ranking
-        - Interactive visualizations
+        
+        **🔍 SHAP Analysis:**
+        - Get detailed model interpretability insights
+        - Understand how each feature contributes to predictions
+        - Install SHAP with: `pip install shap`
+        
+        **🎯 Individual Predictions:**
+        - Input custom values for all columns
+        - Get instant FS score predictions
+        - See which features are used for training vs. display
+        
+        **📊 Dataset Predictions:**
+        - Generate predictions for entire dataset
+        - Compare actual vs predicted FS values
+        - Download results with difference calculations
+        
+        ### 🔧 Hyperparameters (Optimized for Small Datasets)
+        
+        - **`n_estimators: 55`** - Number of boosting rounds. Lower value to prevent overfitting on small datasets
+        - **`max_depth: 5`** - Maximum tree depth. Shallow trees reduce complexity for limited data
+        - **`learning_rate: 0.1`** - Step size shrinkage. Standard rate balancing training speed and accuracy
+        - **`subsample: 0.45`** - Fraction of samples used per tree. Low value prevents overfitting with limited rows
+        - **`colsample_bytree: 0.5`** - Fraction of features used per tree. Reduces overfitting and adds regularization
+        - **`reg_alpha: 0.015`** - L1 regularization. Light regularization to prevent overfitting
+        - **`reg_lambda: 1.5`** - L2 regularization. Stronger L2 penalty for model stability on small data
+        - **`tree_method: 'hist'`** - Histogram-based algorithm for faster CPU training
+        
+        ### ⚙️ Model Configuration
+        - **Algorithm:** XGBoost Regressor  
+        - **Cross-Validation:** 5-Fold Stratified  
+        - **Feature Importance:** Calculated on all available features  
+        - **SHAP Analysis:** Uses model trained on all features
+        - **Predictions:** Based only on core training features
         """)
 
 if __name__ == "__main__":
