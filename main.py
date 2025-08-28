@@ -89,7 +89,7 @@ def add_mse_trees_analysis_to_main():
 
 def create_detailed_feature_importance_table(model, feature_names, target_features=None):
     """
-    Create a comprehensive feature importance table with gain, cover, frequency, and order.
+    Create a comprehensive feature importance table with gain, cover, frequency, and custom order.
     
     Parameters:
     - model: Trained XGBoost model
@@ -108,7 +108,6 @@ def create_detailed_feature_importance_table(model, feature_names, target_featur
         booster = model.get_booster()
         
         # Get importance scores for different metrics
-        # Use 'weight' instead of 'frequency' for broader XGBoost version compatibility
         gain_importance = booster.get_score(importance_type='gain')
         cover_importance = booster.get_score(importance_type='cover')
         weight_importance = booster.get_score(importance_type='weight')  # Number of times feature is used
@@ -116,6 +115,9 @@ def create_detailed_feature_importance_table(model, feature_names, target_featur
         # If target_features is specified, filter to only those features
         if target_features is None:
             target_features = feature_names
+        
+        # Define the custom ranking order
+        custom_order = ["inflation", "hhis", "hhit", "hhig", "hhic", "ccr", "mcr"]
         
         # Create comprehensive importance table
         importance_data = []
@@ -125,13 +127,20 @@ def create_detailed_feature_importance_table(model, feature_names, target_featur
                 # Get scores (default to 0 if feature not used in any splits)
                 gain = gain_importance.get(feature, 0.0)
                 cover = cover_importance.get(feature, 0.0)
-                weight = weight_importance.get(feature, 0.0)
+                frequency = weight_importance.get(feature, 0.0)  # Renamed from weight to frequency
+                
+                # Custom ranking based on predefined order
+                if feature in custom_order:
+                    custom_rank = custom_order.index(feature) + 1
+                else:
+                    custom_rank = len(custom_order) + 1
                 
                 importance_data.append({
                     'Feature': feature,
                     'Gain': gain,
                     'Cover': cover,
-                    'Weight': weight
+                    'Frequency': frequency,
+                    'Custom_Rank': custom_rank
                 })
         
         # Convert to DataFrame
@@ -141,18 +150,15 @@ def create_detailed_feature_importance_table(model, feature_names, target_featur
             st.warning("No matching features found in the model.")
             return pd.DataFrame()
         
-        # Add order columns (rank by each metric, 1 = highest importance)
-        importance_df['Gain_Order'] = importance_df['Gain'].rank(ascending=False, method='min').astype(int)
-        importance_df['Cover_Order'] = importance_df['Cover'].rank(ascending=False, method='min').astype(int)
-        importance_df['Weight_Order'] = importance_df['Weight'].rank(ascending=False, method='min').astype(int)
-        
-        # Sort by gain (most common importance metric)
-        importance_df = importance_df.sort_values('Gain', ascending=False).reset_index(drop=True)
+
+        importance_df["Custom_Rank"] = importance_df["Custom_Rank"]-1
+        # Sort by custom ranking order
+        importance_df = importance_df.sort_values('Custom_Rank', ascending=True).reset_index(drop=True)
         
         # Format the values for better display
         importance_df['Gain'] = importance_df['Gain'].apply(lambda x: f"{x:.6f}")
         importance_df['Cover'] = importance_df['Cover'].apply(lambda x: f"{x:.6f}")
-        importance_df['Weight'] = importance_df['Weight'].apply(lambda x: f"{x:.0f}")
+        importance_df['Frequency'] = importance_df['Frequency'].apply(lambda x: f"{x:.0f}")
         
         return importance_df
         
@@ -199,10 +205,8 @@ def display_detailed_importance_analysis(model, feature_names, target_features=N
             "Feature": st.column_config.TextColumn("Feature", help="Feature name"),
             "Gain": st.column_config.TextColumn("Gain", help="Average gain across all splits using this feature"),
             "Cover": st.column_config.TextColumn("Cover", help="Average coverage across all splits using this feature"),
-            "Weight": st.column_config.TextColumn("Weight", help="Number of times feature is used in splits"),
-            "Gain_Order": st.column_config.NumberColumn("Gain Rank", help="Rank by gain importance (1 = highest)"),
-            "Cover_Order": st.column_config.NumberColumn("Cover Rank", help="Rank by cover importance (1 = highest)"),
-            "Weight_Order": st.column_config.NumberColumn("Weight Rank", help="Rank by weight importance (1 = highest)")
+            "Frequency": st.column_config.TextColumn("Frequency", help="Number of times feature is used in splits"),
+            "Custom_Rank": st.column_config.NumberColumn("Rank", help="Custom ranking order: inflation, hhis, hhit, hhig, hhic, ccr, mcr")
         }
     )
     
