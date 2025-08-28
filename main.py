@@ -25,7 +25,7 @@ except ImportError:
 
 st.set_page_config(
     page_title="XGBoost Model Training",
-    page_icon="🚀",
+#     page_icon="🚀",
     layout="wide"
 )
 
