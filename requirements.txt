@@ -1,0 +1,10 @@
+
+# Core libraries (matched to your Kaggle run)
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.2.2
+xgboost==2.0.3
+
+# Streamlit (leave unpinned so you get a recent compatible build;
+# pin a specific version if you prefer exact Streamlit behaviour)
+streamlit
