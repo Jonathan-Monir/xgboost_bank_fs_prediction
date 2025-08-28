@@ -87,6 +87,174 @@ def add_mse_trees_analysis_to_main():
                 
                 # Show data preview
 
+def create_detailed_feature_importance_table(model, feature_names, target_features=None):
+    """
+    Create a comprehensive feature importance table with gain, cover, frequency, and order.
+    
+    Parameters:
+    - model: Trained XGBoost model
+    - feature_names: List of feature names used in training
+    - target_features: Specific features to include (default: all features)
+    
+    Returns:
+    - DataFrame with detailed importance metrics
+    """
+    import pandas as pd
+    import numpy as np
+    import streamlit as st
+    
+    try:
+        # Get the booster from the XGBoost model
+        booster = model.get_booster()
+        
+        # Get importance scores for different metrics
+        # Use 'weight' instead of 'frequency' for broader XGBoost version compatibility
+        gain_importance = booster.get_score(importance_type='gain')
+        cover_importance = booster.get_score(importance_type='cover')
+        weight_importance = booster.get_score(importance_type='weight')  # Number of times feature is used
+        
+        # If target_features is specified, filter to only those features
+        if target_features is None:
+            target_features = feature_names
+        
+        # Create comprehensive importance table
+        importance_data = []
+        
+        for feature in target_features:
+            if feature in feature_names:
+                # Get scores (default to 0 if feature not used in any splits)
+                gain = gain_importance.get(feature, 0.0)
+                cover = cover_importance.get(feature, 0.0)
+                weight = weight_importance.get(feature, 0.0)
+                
+                importance_data.append({
+                    'Feature': feature,
+                    'Gain': gain,
+                    'Cover': cover,
+                    'Weight': weight
+                })
+        
+        # Convert to DataFrame
+        importance_df = pd.DataFrame(importance_data)
+        
+        if len(importance_df) == 0:
+            st.warning("No matching features found in the model.")
+            return pd.DataFrame()
+        
+        # Add order columns (rank by each metric, 1 = highest importance)
+        importance_df['Gain_Order'] = importance_df['Gain'].rank(ascending=False, method='min').astype(int)
+        importance_df['Cover_Order'] = importance_df['Cover'].rank(ascending=False, method='min').astype(int)
+        importance_df['Weight_Order'] = importance_df['Weight'].rank(ascending=False, method='min').astype(int)
+        
+        # Sort by gain (most common importance metric)
+        importance_df = importance_df.sort_values('Gain', ascending=False).reset_index(drop=True)
+        
+        # Format the values for better display
+        importance_df['Gain'] = importance_df['Gain'].apply(lambda x: f"{x:.6f}")
+        importance_df['Cover'] = importance_df['Cover'].apply(lambda x: f"{x:.6f}")
+        importance_df['Weight'] = importance_df['Weight'].apply(lambda x: f"{x:.0f}")
+        
+        return importance_df
+        
+    except Exception as e:
+        st.error(f"Error creating detailed importance table: {str(e)}")
+        return pd.DataFrame()
+
+
+def display_detailed_importance_analysis(model, feature_names, target_features=None):
+    """
+    Display comprehensive feature importance analysis with visualizations.
+    """
+    import plotly.express as px
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import streamlit as st
+    import pandas as pd
+    
+    # Default target features if not specified
+    if target_features is None:
+        target_features = ["hhis", "hhig", "hhic", "hhit", "ccr", "mcr"]
+    
+    st.subheader("🎯 Detailed Feature Importance Analysis")
+    st.write(f"Analyzing importance metrics for: {', '.join(target_features)}")
+    
+    # Create the detailed importance table
+    importance_df = create_detailed_feature_importance_table(model, feature_names, target_features)
+    
+    if len(importance_df) == 0:
+        st.warning("No data available for importance analysis.")
+        return
+    
+    # Display the comprehensive table
+    st.subheader("📊 Complete Feature Importance Metrics")
+    
+    # Create formatted display table
+    display_df = importance_df.copy()
+    
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Feature": st.column_config.TextColumn("Feature", help="Feature name"),
+            "Gain": st.column_config.TextColumn("Gain", help="Average gain across all splits using this feature"),
+            "Cover": st.column_config.TextColumn("Cover", help="Average coverage across all splits using this feature"),
+            "Weight": st.column_config.TextColumn("Weight", help="Number of times feature is used in splits"),
+            "Gain_Order": st.column_config.NumberColumn("Gain Rank", help="Rank by gain importance (1 = highest)"),
+            "Cover_Order": st.column_config.NumberColumn("Cover Rank", help="Rank by cover importance (1 = highest)"),
+            "Weight_Order": st.column_config.NumberColumn("Weight Rank", help="Rank by weight importance (1 = highest)")
+        }
+    )
+    
+    
+    return importance_df
+
+
+# Integration function to add to your main Streamlit app
+def add_detailed_importance_to_streamlit(final_model, feature_names):
+    """
+    Add this to your main Streamlit app after training the model.
+    """
+    
+    # Target features for analysis
+    target_features = ["hhis", "hhig", "hhic", "hhit", "ccr", "mcr"]
+    
+    st.markdown("---")
+    
+    # Display the detailed analysis
+    detailed_df = display_detailed_importance_analysis(
+        final_model, 
+        feature_names, 
+        target_features
+    )
+    
+    return detailed_df
+
+
+# Example usage function for testing
+def example_usage():
+    """
+    Example of how to use these functions with your existing XGBoost model.
+    """
+    
+    # Assuming you have a trained model and feature names
+    # model = your_trained_xgb_model
+    # feature_names = ["hhis", "hhig", "hhic", "hhit", "ccr", "mcr", "inflation", "bank_age", "ownership"]
+    # target_features = ["hhis", "hhig", "hhic", "hhit", "ccr", "mcr"]
+    
+    # Create the detailed importance table
+    # importance_df = create_detailed_feature_importance_table(model, feature_names, target_features)
+    
+    # Or display the full analysis with visualizations
+    # display_detailed_importance_analysis(model, feature_names, target_features)
+    
+    pass
+
+
+
+
+
+
 def create_mse_vs_trees_plot(df, random_seed=1471, cpu_threads=1, max_trees=100):
     """
     Create a line plot showing MSE vs number of trees for training and cross-validation.
@@ -771,6 +939,21 @@ def main():
                         
                         st.dataframe(fold_df_display, use_container_width=True, hide_index=True)
                         
+# After your existing feature importance display...
+                        st.markdown("---")
+
+# Detailed Feature Importance Analysis for Specific Features
+                        target_features = ["hhis", "hhig", "hhic", "hhit", "ccr", "mcr"]
+                        final_feature_names = X_all_for_shap.columns.tolist()
+
+                        detailed_importance_df = display_detailed_importance_analysis(
+                            final_model, 
+                            final_feature_names, 
+                            target_features
+                        )
+
+# Store in session state if you want to use it elsewhere
+                        st.session_state.detailed_importance = detailed_importance_df
 #                         with st.expander("📋 Dataset Preview", expanded=False):
 #                             st.dataframe(df.head(10))
 
