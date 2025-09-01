@@ -19,6 +19,7 @@ warnings.filterwarnings('ignore')
 import seaborn as sns
 import matplotlib.pyplot as plt
 import pickle  # Added for saving scaler
+import time
 # Try to import SHAP
 try:
     import shap
@@ -30,6 +31,340 @@ st.set_page_config(
     page_title="XGBoost Model Training",
     layout="wide"
 )
+
+def optimize_random_seeds(df, start_seed=1, end_seed=100, top_n=10, show_progress=True):
+    """
+    Optimize random seeds by training models with different seeds and ranking by CV R² mean.
+    
+    Parameters:
+    - df: Input dataframe
+    - start_seed: Starting random seed value
+    - end_seed: Ending random seed value  
+    - top_n: Number of top seeds to return
+    - show_progress: Whether to show progress bar
+    
+    Returns:
+    - results_df: DataFrame with seed results ranked by CV R² mean
+    - best_seed: The best performing seed
+    - best_results: Results from the best seed
+    """
+    
+    # Required features
+    feature_cols = ["hhis", "hhit", "ccr", "mcr", "ownership", "inflation", "bank_age"]
+    target_col = "fs"
+    
+    # Verify columns
+    missing = [c for c in feature_cols + [target_col] if c not in df.columns]
+    if missing:
+        st.error(f"Missing required columns: {missing}")
+        return None, None, None
+    
+    # Prepare data once
+    X = df[feature_cols].copy()
+    y = df[target_col].copy()
+    
+    # Handle missing values
+    if X.isnull().sum().sum() > 0:
+        X = X.fillna(X.median())
+    if y.isnull().sum() > 0:
+        mask = ~y.isnull()
+        X = X.loc[mask]
+        y = y.loc[mask]
+    
+    # XGBoost parameters
+    base_params = {
+        'n_estimators': 55,
+        'max_depth': 5,
+        'learning_rate': 0.1,
+        'subsample': 0.45,
+        'colsample_bytree': 0.5,
+        'reg_alpha': 0.015,
+        'reg_lambda': 1.5,
+        'n_jobs': 1,
+        'tree_method': 'hist',
+        'verbosity': 0
+    }
+    
+    seed_results = []
+    seed_range = range(start_seed, end_seed + 1)
+    
+    if show_progress:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+    
+    for i, seed in enumerate(seed_range):
+        if show_progress:
+            status_text.text(f"Testing seed {seed}/{end_seed} (Progress: {i+1}/{len(seed_range)})")
+            progress_bar.progress((i + 1) / len(seed_range))
+        
+        try:
+            # Initialize scaler for this seed
+            scaler = MinMaxScaler()
+            X_scaled = pd.DataFrame(
+                scaler.fit_transform(X), 
+                columns=X.columns, 
+                index=X.index
+            )
+            
+            # Set seed for reproducibility
+            np.random.seed(seed)
+            
+            # Create stratified classes
+            try:
+                y_classes = create_target_classes(y, n_classes=3)
+                skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+                splits = list(skf.split(X_scaled, y_classes))
+            except Exception:
+                from sklearn.model_selection import KFold
+                kf = KFold(n_splits=5, shuffle=True, random_state=seed)
+                splits = list(kf.split(X_scaled))
+            
+            # Cross-validation
+            r2_scores = []
+            rmse_scores = []
+            mae_scores = []
+            mse_scores = []
+            
+            params_with_seed = base_params.copy()
+            params_with_seed['random_state'] = seed
+            
+            for train_idx, test_idx in splits:
+                X_train, X_test = X_scaled.iloc[train_idx], X_scaled.iloc[test_idx]
+                y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+                
+                model = xgb.XGBRegressor(**params_with_seed)
+                model.fit(X_train, y_train)
+                
+                y_pred = model.predict(X_test)
+                
+                r2_scores.append(r2_score(y_test, y_pred))
+                mse = mean_squared_error(y_test, y_pred)
+                mse_scores.append(mse)
+                rmse_scores.append(np.sqrt(mse))
+                mae_scores.append(mean_absolute_error(y_test, y_pred))
+            
+            # Calculate means and standard deviations
+            r2_mean = np.mean(r2_scores)
+            r2_std = np.std(r2_scores, ddof=1) if len(r2_scores) > 1 else 0
+            rmse_mean = np.mean(rmse_scores)
+            mae_mean = np.mean(mae_scores)
+            mse_mean = np.mean(mse_scores)
+            
+            seed_results.append({
+                'Seed': seed,
+                'CV_R2_Mean': r2_mean,
+                'CV_R2_Std': r2_std,
+                'CV_RMSE_Mean': rmse_mean,
+                'CV_MAE_Mean': mae_mean,
+                'CV_MSE_Mean': mse_mean,
+                'R2_Scores': r2_scores  # Store individual fold scores
+            })
+            
+        except Exception as e:
+            if show_progress:
+                st.warning(f"Error with seed {seed}: {str(e)}")
+            continue
+    
+    if show_progress:
+        progress_bar.empty()
+        status_text.empty()
+    
+    if not seed_results:
+        st.error("No successful seed evaluations completed")
+        return None, None, None
+    
+    # Create results DataFrame
+    results_df = pd.DataFrame(seed_results)
+    
+    # Sort by CV R² mean (descending)
+    results_df = results_df.sort_values('CV_R2_Mean', ascending=False).reset_index(drop=True)
+    
+    # Get top N results
+    top_results = results_df.head(top_n)
+    
+    # Best seed and its results
+    best_seed = int(top_results.iloc[0]['Seed'])
+    best_results = top_results.iloc[0].to_dict()
+    
+    return results_df, best_seed, best_results
+
+def display_seed_optimization_results(results_df, best_seed, best_results, top_n=10):
+    """Display the results of seed optimization"""
+    
+    st.subheader(f"🏆 Best Random Seed: {best_seed}")
+    
+    # Display best seed metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("CV R² Mean", f"{best_results['CV_R2_Mean']:.6f}")
+    with col2:
+        st.metric("CV R² Std", f"{best_results['CV_R2_Std']:.6f}")
+    with col3:
+        st.metric("CV RMSE Mean", f"{best_results['CV_RMSE_Mean']:.4f}")
+    with col4:
+        st.metric("CV MAE Mean", f"{best_results['CV_MAE_Mean']:.4f}")
+    
+    # Top seeds table
+    st.subheader(f"📊 Top {top_n} Random Seeds")
+    
+    display_df = results_df.head(top_n).copy()
+    display_df['Rank'] = range(1, len(display_df) + 1)
+    
+    # Reorder columns for better display
+    display_df = display_df[['Rank', 'Seed', 'CV_R2_Mean', 'CV_R2_Std', 'CV_RMSE_Mean', 'CV_MAE_Mean', 'CV_MSE_Mean']]
+    
+    # Format for display
+    display_df['CV_R2_Mean'] = display_df['CV_R2_Mean'].apply(lambda x: f"{x:.6f}")
+    display_df['CV_R2_Std'] = display_df['CV_R2_Std'].apply(lambda x: f"{x:.6f}")
+    display_df['CV_RMSE_Mean'] = display_df['CV_RMSE_Mean'].apply(lambda x: f"{x:.4f}")
+    display_df['CV_MAE_Mean'] = display_df['CV_MAE_Mean'].apply(lambda x: f"{x:.4f}")
+    display_df['CV_MSE_Mean'] = display_df['CV_MSE_Mean'].apply(lambda x: f"{x:.4f}")
+    
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # Visualization of seed performance
+    st.subheader("📈 Seed Performance Visualization")
+    
+    # Create visualization of top seeds
+    top_seeds_viz = results_df.head(min(20, len(results_df)))
+    
+    fig = go.Figure()
+    
+    # Add R² scores
+    fig.add_trace(go.Scatter(
+        x=top_seeds_viz['Seed'],
+        y=top_seeds_viz['CV_R2_Mean'],
+        mode='lines+markers',
+        name='CV R² Mean',
+        line=dict(color='blue', width=2),
+        marker=dict(size=8, color='blue'),
+        error_y=dict(
+            type='data',
+            array=top_seeds_viz['CV_R2_Std'],
+            visible=True,
+            color='blue',
+            thickness=1
+        )
+    ))
+    
+    # Highlight best seed
+    best_row = top_seeds_viz.iloc[0]
+    fig.add_trace(go.Scatter(
+        x=[best_row['Seed']],
+        y=[best_row['CV_R2_Mean']],
+        mode='markers',
+        name=f'Best Seed ({best_seed})',
+        marker=dict(size=15, color='red', symbol='star', line=dict(width=2, color='darkred'))
+    ))
+    
+    fig.update_layout(
+        title=f'CV R² Performance Across Different Random Seeds (Top 20)',
+        xaxis_title='Random Seed',
+        yaxis_title='CV R² Mean',
+        height=500,
+        hovermode='x unified'
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Download results
+    st.subheader("💾 Download Seed Optimization Results")
+    
+    # Prepare download data (remove R2_Scores column for CSV)
+    download_df = results_df.drop('R2_Scores', axis=1)
+    csv_data = download_df.to_csv(index=False)
+    
+    st.download_button(
+        "📥 Download All Seed Results",
+        csv_data,
+        "seed_optimization_results.csv",
+        "text/csv",
+        help="Download complete seed optimization results"
+    )
+    
+    return best_seed
+
+def add_seed_optimization_interface():
+    """Add seed optimization interface to the main app"""
+    
+    st.markdown("---")
+    st.header("🎲 Random Seed Optimization")
+    st.write("Find the best random seed by testing multiple seeds and ranking by CV R² performance.")
+    
+    # Controls for seed optimization
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        start_seed = st.number_input("Start Seed", min_value=1, max_value=10000, value=1, step=1)
+    with col2:
+        end_seed = st.number_input("End Seed", min_value=1, max_value=10000, value=100, step=1)
+    with col3:
+        top_n = st.number_input("Top N Seeds to Show", min_value=5, max_value=50, value=10, step=1)
+    
+    # Validation
+    if start_seed >= end_seed:
+        st.error("Start seed must be less than end seed")
+        return
+    
+    if (end_seed - start_seed + 1) > 1000:
+        st.warning("Large seed range detected. This may take a long time. Consider reducing the range.")
+    
+    # Estimate time
+    estimated_time = (end_seed - start_seed + 1) * 2  # Rough estimate: 2 seconds per seed
+    if estimated_time > 60:
+        st.info(f"Estimated time: ~{estimated_time//60} minutes {estimated_time%60} seconds")
+    else:
+        st.info(f"Estimated time: ~{estimated_time} seconds")
+    
+    # Optimization button
+    if st.button("🔍 Optimize Random Seeds", type="primary"):
+        if 'df' not in st.session_state:
+            st.error("Please upload data first.")
+            return
+        
+        start_time = time.time()
+        
+        # Run optimization
+        results_df, best_seed, best_results = optimize_random_seeds(
+            st.session_state.df,
+            start_seed=start_seed,
+            end_seed=end_seed,
+            top_n=top_n,
+            show_progress=True
+        )
+        
+        if results_df is not None:
+            elapsed_time = time.time() - start_time
+            st.success(f"Optimization completed in {elapsed_time:.1f} seconds!")
+            
+            # Store results in session state
+            st.session_state.seed_results = results_df
+            st.session_state.best_seed = best_seed
+            st.session_state.best_results = best_results
+            
+            # Display results
+            display_seed_optimization_results(results_df, best_seed, best_results, top_n)
+            
+            # Option to train with best seed
+            st.markdown("---")
+            st.subheader("🚀 Train with Best Seed")
+            if st.button(f"Train Model with Best Seed ({best_seed})", type="secondary"):
+                with st.spinner(f"Training model with seed {best_seed}..."):
+                    results = train_xgboost_model(st.session_state.df, random_seed=best_seed)
+                    
+                    if results is not None:
+                        fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_shap, scaler = results
+                        
+                        # Store in session state
+                        st.session_state.training_model = training_model
+                        st.session_state.final_model = final_model
+                        st.session_state.X_all_for_shap = X_all_for_shap
+                        st.session_state.scaler = scaler
+                        st.session_state.feature_cols = feature_cols
+                        
+                        st.success(f"Model trained successfully with seed {best_seed}!")
+                        st.balloons()
+        else:
+            st.error("Seed optimization failed. Please check your data and try again.")
 
 def add_mse_trees_analysis_to_main():
     """
@@ -559,7 +894,6 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
 
     # XGBoost params tuned for small/container environments
     param_dict = {
-        'n_estimators': 55,
         'max_depth': 5,
         'learning_rate': 0.1,
         'subsample': 0.45,
@@ -603,7 +937,7 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
         X_train, X_test = X_scaled.iloc[train_idx], X_scaled.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
         
-        xgb_model = xgb.XGBRegressor(**param_dict)
+        xgb_model = xgb.XGBRegressor(n_estimators=55, **param_dict)
 
         # fit with scaled data
         xgb_model.fit(X_train, y_train)
@@ -637,13 +971,13 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
     total_time = time.perf_counter() - total_start
 
     # Training model on scaled feature_cols for predictions
-    training_model = xgb.XGBRegressor(**param_dict)
+    training_model = xgb.XGBRegressor(n_estimators=55, **param_dict)
     training_model.fit(X_scaled, y)
 
     # final model on X_all_scaled for feature importance and SHAP
     final_idx = y.index
     X_all_for_fit = X_all_scaled.loc[final_idx] if not X_all_scaled.empty else X_scaled.loc[final_idx]
-    final_model = xgb.XGBRegressor(**param_dict)
+    final_model = xgb.XGBRegressor(n_estimators=55, **param_dict)
     final_model.fit(X_all_for_fit, y)
 
     # feature importance
@@ -906,6 +1240,9 @@ def main():
             # Load data
             df = load_data(uploaded_file)
             
+            # Store in session state
+            st.session_state.df = df
+            
             # Display basic info about the dataset
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -919,14 +1256,27 @@ def main():
             with st.expander("📋 Dataset Preview", expanded=False):
                 st.dataframe(df.head(10))
             
+            # ADD SEED OPTIMIZATION INTERFACE
+            add_seed_optimization_interface()
+            
             # Training section
             st.markdown("---")
             st.header("Model Training")
             
+            # Use best seed if available, otherwise use default
+            if 'best_seed' in st.session_state:
+                default_seed = st.session_state.best_seed
+                st.info(f"Using optimized seed: {default_seed}")
+            else:
+                default_seed = 1471
+            
+            # Seed input for manual training
+            manual_seed = st.number_input("Manual Random Seed", min_value=1, max_value=10000, value=default_seed, step=1)
+            
             # Train button
             if st.button("🚀 Train XGBoost Model", type="primary"):
                 with st.spinner("Training XGBoost model"):
-                    results = train_xgboost_model(df, random_seed=1471)
+                    results = train_xgboost_model(df, random_seed=manual_seed)
                     
                     if results is not None:
                         fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_shap, scaler = results
@@ -936,7 +1286,6 @@ def main():
                         st.session_state.final_model = final_model
                         st.session_state.X_all_for_shap = X_all_for_shap
                         st.session_state.scaler = scaler  # Store the scaler
-                        st.session_state.df = df
                         st.session_state.feature_cols = ["hhis", "hhit", "ccr", "mcr", "ownership", "inflation", "bank_age"]
                         
                         # Display results
@@ -1118,6 +1467,28 @@ def main():
         **Target Variable:**
         - `fs` - Target variable (continuous)
         
+        ### 🎲 NEW: Random Seed Optimization
+        
+        **✅ What's New:**
+        - **Automatic Seed Testing:** Test multiple random seeds to find the best performing one
+        - **CV R² Optimization:** Seeds are ranked by their cross-validation R² mean performance
+        - **Visual Performance Analysis:** See how different seeds perform with interactive plots
+        - **Best Seed Integration:** Automatically use the best seed for subsequent training
+        - **Comprehensive Results:** Download complete seed optimization results
+        
+        **🎯 How It Works:**
+        1. **Set Seed Range:** Choose start and end seed values (e.g., 1 to 100)
+        2. **Automatic Testing:** Each seed is tested with 5-fold cross-validation
+        3. **Performance Ranking:** Seeds ranked by CV R² mean (higher is better)
+        4. **Best Seed Selection:** Top performing seed is highlighted and recommended
+        5. **One-Click Training:** Train your final model with the optimal seed
+        
+        **📊 Results Provided:**
+        - Top N best performing seeds with detailed metrics
+        - CV R² mean, standard deviation, RMSE, MAE, MSE for each seed
+        - Interactive visualization showing seed performance trends
+        - Downloadable results for further analysis
+        
         ### 🔧 MinMaxScaler Integration
         
         **✅ What's New:**
@@ -1166,6 +1537,7 @@ def main():
         - **Feature Importance:** Calculated on scaled features
         - **SHAP Analysis:** Uses scaled features for interpretation
         - **Predictions:** Automatic scaling applied to user inputs
+        - **Seed Optimization:** Find best random seed for maximum performance
         """)
 
 if __name__ == "__main__":
