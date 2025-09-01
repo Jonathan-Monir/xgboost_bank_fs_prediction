@@ -294,7 +294,7 @@ def add_seed_optimization_interface():
     # Controls for seed optimization
     col1, col2, col3 = st.columns(3)
     with col1:
-        start_seed = st.number_input("Start Seed", min_value=1, max_value=10000, value=1, step=1)
+        start_seed = st.number_input("Start Seed", min_value=1, max_value=100000, value=1, step=1)
     with col2:
         end_seed = st.number_input("End Seed", min_value=1, max_value=100000, value=100, step=1)
     with col3:
@@ -1271,7 +1271,7 @@ def main():
                 default_seed = 1471
             
             # Seed input for manual training
-            manual_seed = st.number_input("Manual Random Seed", min_value=1, max_value=10000, value=default_seed, step=1)
+            manual_seed = st.number_input("Manual Random Seed", min_value=1, max_value=100000, value=default_seed, step=1)
             
             # Train button
             if st.button("🚀 Train XGBoost Model", type="primary"):
