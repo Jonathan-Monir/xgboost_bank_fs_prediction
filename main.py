@@ -296,7 +296,7 @@ def add_seed_optimization_interface():
     with col1:
         start_seed = st.number_input("Start Seed", min_value=1, max_value=10000, value=1, step=1)
     with col2:
-        end_seed = st.number_input("End Seed", min_value=1, max_value=10000, value=100, step=1)
+        end_seed = st.number_input("End Seed", min_value=1, max_value=100000, value=100, step=1)
     with col3:
         top_n = st.number_input("Top N Seeds to Show", min_value=5, max_value=50, value=10, step=1)
     
