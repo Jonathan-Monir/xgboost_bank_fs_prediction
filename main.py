@@ -10,6 +10,7 @@ import numpy as np
 import xgboost as xgb
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.preprocessing import MinMaxScaler  # Added MinMaxScaler import
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -17,6 +18,7 @@ import warnings
 warnings.filterwarnings('ignore')
 import seaborn as sns
 import matplotlib.pyplot as plt
+import pickle  # Added for saving scaler
 # Try to import SHAP
 try:
     import shap
@@ -26,7 +28,6 @@ except ImportError:
 
 st.set_page_config(
     page_title="XGBoost Model Training",
-#     page_icon="🚀",
     layout="wide"
 )
 
@@ -47,14 +48,14 @@ def add_mse_trees_analysis_to_main():
     with col1:
         max_trees = 80
 
-
     if st.button("🔍 Analyze MSE vs Trees", type="secondary"):
-        if 'df' not in st.session_state:
+        if 'df' not in st.session_state or 'scaler' not in st.session_state:
             st.error("Please train a model first or upload data.")
         else:
             # Run the analysis
             result = create_mse_vs_trees_plot(
                 st.session_state.df, 
+                st.session_state.scaler,  # Pass the scaler
                 random_seed=1471, 
                 cpu_threads=1, 
                 max_trees=max_trees
@@ -65,8 +66,6 @@ def add_mse_trees_analysis_to_main():
                 
                 # Display the plot
                 st.plotly_chart(fig, use_container_width=True)
-                
-                
                 
                 # Data download
                 st.subheader("💾 Download Analysis Data")
@@ -84,8 +83,6 @@ def add_mse_trees_analysis_to_main():
                     "text/csv",
                     help="Download the MSE values for different tree counts"
                 )
-                
-                # Show data preview
 
 def create_detailed_feature_importance_table(model, feature_names, target_features=None):
     """
@@ -149,7 +146,6 @@ def create_detailed_feature_importance_table(model, feature_names, target_featur
         if len(importance_df) == 0:
             st.warning("No matching features found in the model.")
             return pd.DataFrame()
-        
 
         importance_df["Custom_Rank"] = importance_df["Custom_Rank"]-1
         # Sort by custom ranking order
@@ -165,7 +161,6 @@ def create_detailed_feature_importance_table(model, feature_names, target_featur
     except Exception as e:
         st.error(f"Error creating detailed importance table: {str(e)}")
         return pd.DataFrame()
-
 
 def display_detailed_importance_analysis(model, feature_names, target_features=None):
     """
@@ -210,9 +205,7 @@ def display_detailed_importance_analysis(model, feature_names, target_features=N
         }
     )
     
-    
     return importance_df
-
 
 # Integration function to add to your main Streamlit app
 def add_detailed_importance_to_streamlit(final_model, feature_names):
@@ -234,32 +227,7 @@ def add_detailed_importance_to_streamlit(final_model, feature_names):
     
     return detailed_df
 
-
-# Example usage function for testing
-def example_usage():
-    """
-    Example of how to use these functions with your existing XGBoost model.
-    """
-    
-    # Assuming you have a trained model and feature names
-    # model = your_trained_xgb_model
-    # feature_names = ["hhis", "hhig", "hhic", "hhit", "ccr", "mcr", "inflation", "bank_age", "ownership"]
-    # target_features = ["hhis", "hhig", "hhic", "hhit", "ccr", "mcr"]
-    
-    # Create the detailed importance table
-    # importance_df = create_detailed_feature_importance_table(model, feature_names, target_features)
-    
-    # Or display the full analysis with visualizations
-    # display_detailed_importance_analysis(model, feature_names, target_features)
-    
-    pass
-
-
-
-
-
-
-def create_mse_vs_trees_plot(df, random_seed=1471, cpu_threads=1, max_trees=100):
+def create_mse_vs_trees_plot(df, scaler, random_seed=1471, cpu_threads=1, max_trees=100):
     """
     Create a line plot showing MSE vs number of trees for training and cross-validation.
     Returns training and CV MSE at different tree counts.
@@ -294,6 +262,13 @@ def create_mse_vs_trees_plot(df, random_seed=1471, cpu_threads=1, max_trees=100)
         X = X.loc[mask]
         y = y.loc[mask]
     
+    # Apply scaling
+    X_scaled = pd.DataFrame(
+        scaler.transform(X), 
+        columns=X.columns, 
+        index=X.index
+    )
+    
     np.random.seed(random_seed)
     
     # Create stratified classes for CV
@@ -319,11 +294,11 @@ def create_mse_vs_trees_plot(df, random_seed=1471, cpu_threads=1, max_trees=100)
     # Initialize CV splitter
     try:
         skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_seed)
-        splits = list(skf.split(X, y_classes))
+        splits = list(skf.split(X_scaled, y_classes))
     except Exception:
         from sklearn.model_selection import KFold
         kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
-        splits = list(kf.split(X))
+        splits = list(kf.split(X_scaled))
     
     # Store MSE values for each tree count
     tree_counts = list(range(1, max_trees + 1, 5))  # Every 5 trees
@@ -339,7 +314,7 @@ def create_mse_vs_trees_plot(df, random_seed=1471, cpu_threads=1, max_trees=100)
             train_mse_scores = []
             
             for train_idx, test_idx in splits:
-                X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+                X_train, X_test = X_scaled.iloc[train_idx], X_scaled.iloc[test_idx]
                 y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
                 
                 # Train model with current number of trees
@@ -402,8 +377,7 @@ def create_mse_vs_trees_plot(df, random_seed=1471, cpu_threads=1, max_trees=100)
             y=0.99,
             xanchor="right",
             x=0.99
-        ),
-#         grid=True
+        )
     )
     
     # Add grid
@@ -436,30 +410,6 @@ def create_correlation_heatmap(df):
     
     # Create mask for upper triangle (to show only lower triangle)
     mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
-    
-    # Create the plot using matplotlib and seaborn
-    fig, ax = plt.subplots(figsize=(12, 10))
-    
-    # Create heatmap
-#     sns.heatmap(corr_matrix, 
-#                 mask=mask, 
-#                 annot=True, 
-#                 cmap='RdBu_r', 
-#                 center=0,
-#                 square=True, 
-#                 linewidths=0.5, 
-#                 cbar_kws={"shrink": 0.5},
-#                 fmt='.3f',
-#                 ax=ax)
-    
-#     plt.title('Correlation Matrix Heatmap', fontsize=16, pad=20)
-#     plt.tight_layout()
-    
-    # Display in Streamlit
-#     st.pyplot(fig)
-    
-    # Also create interactive plotly version
-#     st.subheader("🔗 Interactive Correlation Matrix")
     
     # Prepare data for plotly heatmap
     corr_values = corr_matrix.values
@@ -534,6 +484,7 @@ def create_correlation_heatmap(df):
     )
     
     return corr_matrix
+
 def create_target_classes(y, n_classes=3):
     """
     Convert continuous target to classes for stratified sampling.
@@ -548,7 +499,7 @@ def create_target_classes(y, n_classes=3):
 def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True):
     """
     Train XGBoost with Streamlit-friendly defaults.
-    Returns: fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_shap
+    Returns: fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_shap, scaler
     """
     import time
     from sklearn.model_selection import StratifiedKFold, KFold
@@ -582,12 +533,29 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
         if show_progress:
             st.warning(f"Missing values found in target - removed {removed} rows")
 
+    # Initialize and fit MinMaxScaler
+    scaler = MinMaxScaler()
+    X_scaled = pd.DataFrame(
+        scaler.fit_transform(X), 
+        columns=X.columns, 
+        index=X.index
+    )
+    
+
     # X_all for final feature importance. keep only existing columns
     all_features = ["inflation", "hhis", "bank_age", "hhit", "hhic", "asset_size", "ownership", "ccr", "mcr", "hhig"]
     all_features = [c for c in all_features if c in df.columns]
     X_all = df[all_features].copy()
     if X_all.isnull().sum().sum() > 0:
         X_all = X_all.fillna(X_all.median())
+    
+    # Create separate scaler for all features
+    scaler_all = MinMaxScaler()
+    X_all_scaled = pd.DataFrame(
+        scaler_all.fit_transform(X_all), 
+        columns=X_all.columns, 
+        index=X_all.index
+    )
 
     # XGBoost params tuned for small/container environments
     param_dict = {
@@ -616,10 +584,10 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
     # Initialize CV splitter; fallback to KFold if stratification is impossible
     try:
         skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_seed)
-        splits = list(skf.split(X, y_classes))
+        splits = list(skf.split(X_scaled, y_classes))
     except Exception:
         kf = KFold(n_splits=5, shuffle=True, random_state=random_seed)
-        splits = list(kf.split(X))
+        splits = list(kf.split(X_scaled))
 
     fold_results = []
     r2_scores = []
@@ -627,18 +595,17 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
     mae_scores = []
     mse_scores = []
     mape_scores = []
-    std_scores = []
 
     total_start = time.perf_counter()
     for fold_num, (train_idx, test_idx) in enumerate(splits, start=1):
         t0 = time.perf_counter()
 
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        X_train, X_test = X_scaled.iloc[train_idx], X_scaled.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        # (do NOT compute y std per fold; we want std of R² across folds)
+        
         xgb_model = xgb.XGBRegressor(**param_dict)
 
-        # fit (silent). For small datasets verbose evaluation slows things; avoid eval_set here.
+        # fit with scaled data
         xgb_model.fit(X_train, y_train)
 
         y_pred = xgb_model.predict(X_test)
@@ -649,15 +616,14 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
         mae = mean_absolute_error(y_test, y_pred)
         mape = np.mean(np.abs((y_test - y_pred) / y_test)) * 100
 
-        # collect fold-level metrics (no per-fold 'Std' of y)
+        # collect fold-level metrics
         r2_scores.append(r2)
         rmse_scores.append(rmse)
         mae_scores.append(mae)
         mse_scores.append(mse)
-        mape_scores = mape_scores if 'mape_scores' in locals() else []
         mape_scores.append(mape)
 
-        # For fold-wise rows keep 'Std' blank (we'll show R² std only in the summary / Mean row)
+        # For fold-wise rows keep 'Std' blank
         fold_results.append({
             'Fold': fold_num,
             'R²': float(r2),
@@ -668,22 +634,19 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
             'Std': ""   # empty for individual folds
         })
 
-        t1 = time.perf_counter()
-
     total_time = time.perf_counter() - total_start
 
-    # Training model on feature_cols for predictions
+    # Training model on scaled feature_cols for predictions
     training_model = xgb.XGBRegressor(**param_dict)
-    training_model.fit(X, y)
+    training_model.fit(X_scaled, y)
 
-    # final model on X_all for feature importance and SHAP
-    # ensure indices align with y used in CV (use rows where target exists)
+    # final model on X_all_scaled for feature importance and SHAP
     final_idx = y.index
-    X_all_for_fit = X_all.loc[final_idx] if not X_all.empty else X.loc[final_idx]
+    X_all_for_fit = X_all_scaled.loc[final_idx] if not X_all_scaled.empty else X_scaled.loc[final_idx]
     final_model = xgb.XGBRegressor(**param_dict)
     final_model.fit(X_all_for_fit, y)
 
-    # feature importance (if X_all exists). if not, fallback to feature_cols
+    # feature importance
     fi_features = all_features if all_features else feature_cols
     importances = final_model.feature_importances_
     # ensure length match
@@ -704,13 +667,13 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
     mse_mean = float(np.mean(mse_scores))
     mape_mean = float(np.mean(mape_scores))
 
-    # Compute std of R² across folds (sample std). If only 1 fold, fallback to 0.0
+    # Compute std of R² across folds
     if len(r2_scores) > 1:
         r2_std = float(np.std(r2_scores, ddof=1))
     else:
         r2_std = 0.0
 
-    # Append mean row (showing R² std in the 'Std' column)
+    # Append mean row
     fold_results.append({
         'Fold': 'Mean',
         'R²': r2_mean,
@@ -731,7 +694,7 @@ def train_xgboost_model(df, random_seed=1471, cpu_threads=1, show_progress=True)
         'CV MAPE Mean': mape_mean,
     }
 
-    return fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_fit
+    return fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_fit, scaler
 
 def create_shap_plots(model, X_sample, feature_names):
     """Create SHAP plots for model interpretation"""
@@ -757,7 +720,7 @@ def create_shap_plots(model, X_sample, feature_names):
         st.error(f"Error creating SHAP analysis: {str(e)}")
         return None, None, None
 
-def create_prediction_interface(training_model, df, feature_cols):
+def create_prediction_interface(training_model, scaler, df, feature_cols):
     """Create interface for user input predictions"""
     st.subheader("🎯 Make Predictions")
     st.write("Enter values for all columns to predict the financial soundness (fs) score:")
@@ -784,10 +747,16 @@ def create_prediction_interface(training_model, df, feature_cols):
                 max_val = float(stats.loc['max', col])
                 mean_val = float(stats.loc['mean', col])
                 
+                if col == "asset_size":
+                    max_val = 100000.0
+
+                if col == "bank_age":
+                    max_val = 300.0
+#                 st.write(np.maximum(max_val,1))
                 user_inputs[col] = st.number_input(
                     f"{col}",
-                    min_value=min_val,
-                    max_value=max_val,
+                    min_value=np.minimum(min_val,0),
+                    max_value=np.maximum(max_val,1),
                     value=mean_val,
                     step=(max_val - min_val) / 100,
                     help=f"Range: {min_val:.3f} to {max_val:.3f}"
@@ -795,20 +764,48 @@ def create_prediction_interface(training_model, df, feature_cols):
             else:
                 user_inputs[col] = st.number_input(f"{col}", value=0.0)
     
+    # Show scaling information
+    st.write("**Scaling Information:**")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("Original input values will be scaled to [0,1] range")
+    with col2:
+        st.write("Model was trained on scaled features")
+    
     # Predict button
     if st.button("🚀 Predict FS Score", type="primary"):
-        # Create input dataframe with only the training features
-        input_df = pd.DataFrame([user_inputs])
-        prediction_input = input_df[feature_cols]
-        
-        # Make prediction
-        prediction = training_model.predict(prediction_input)[0]
-        
-        # Display prediction
-        st.success(f"**Predicted Financial Soundness (FS) Score: {prediction:.4f}**")
-        
+        try:
+            # Create input dataframe with only the training features
+            input_df = pd.DataFrame([user_inputs])
+            prediction_input = input_df[feature_cols]
+            
+            # Apply MinMax scaling to user input
+            prediction_input_scaled = pd.DataFrame(
+                scaler.transform(prediction_input),
+                columns=prediction_input.columns
+            )
+            
+            # Show before and after scaling
+            with st.expander("📊 View Scaling Applied to Your Input"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("**Original Values:**")
+                    st.dataframe(prediction_input.T, use_container_width=True, column_config={0: "Value"})
+                with col2:
+                    st.write("**Scaled Values [0,1]:**")
+                    st.dataframe(prediction_input_scaled.T, use_container_width=True, column_config={0: "Scaled Value"})
+            
+            # Make prediction using scaled input
+            prediction = training_model.predict(prediction_input_scaled)[0]
+            
+            # Display prediction
+            st.success(f"**Predicted Financial Soundness (FS) Score: {prediction:.4f}**")
+            
+        except Exception as e:
+            st.error(f"Error making prediction: {str(e)}")
+            st.error("Please ensure all required features are provided")
 
-def create_csv_predictions(training_model, df, feature_cols):
+def create_csv_predictions(training_model, scaler, df, feature_cols):
     """Create predictions for all rows in the dataset"""
     st.subheader("📊 Dataset Predictions")
     
@@ -822,8 +819,16 @@ def create_csv_predictions(training_model, df, feature_cols):
     # Prepare prediction input
     prediction_input = df[feature_cols].fillna(df[feature_cols].median())
     
+    # Apply MinMax scaling
+    prediction_input_scaled = pd.DataFrame(
+        scaler.transform(prediction_input),
+        columns=prediction_input.columns,
+        index=prediction_input.index
+    )
+    
+    
     # Make predictions
-    predictions = training_model.predict(prediction_input)
+    predictions = training_model.predict(prediction_input_scaled)
     
     # Create results dataframe
     results_df = df.copy()
@@ -893,6 +898,9 @@ def main():
         help="Upload your CSV or Excel file containing the training data"
     )
     
+    # Add scaling information in sidebar
+    st.sidebar.markdown("---")
+    
     if uploaded_file is not None:
         try:
             # Load data
@@ -917,16 +925,17 @@ def main():
             
             # Train button
             if st.button("🚀 Train XGBoost Model", type="primary"):
-                with st.spinner("Training XGBoost model..."):
+                with st.spinner("Training XGBoost model"):
                     results = train_xgboost_model(df, random_seed=1471)
                     
                     if results is not None:
-                        fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_shap = results
+                        fold_results, summary_stats, feature_importance, final_model, training_model, X_all_for_shap, scaler = results
                         
-                        # Store models in session state for later use
+                        # Store models and scaler in session state for later use
                         st.session_state.training_model = training_model
                         st.session_state.final_model = final_model
                         st.session_state.X_all_for_shap = X_all_for_shap
+                        st.session_state.scaler = scaler  # Store the scaler
                         st.session_state.df = df
                         st.session_state.feature_cols = ["hhis", "hhit", "ccr", "mcr", "ownership", "inflation", "bank_age"]
                         
@@ -942,7 +951,7 @@ def main():
                             st.metric("MAE Mean", f"{summary_stats['CV MAE Mean']:.4f}")
                             st.metric("MSE Mean", f"{summary_stats['CV MSE Mean']:.4f}")
                         with col3:
-                            # show R² standard deviation here (new)
+                            # show R² standard deviation here
                             st.metric("R² Std", f"{summary_stats['CV R² Std']:.6f}")
                             st.metric("MAPE Mean", f"{summary_stats['CV MAPE Mean']:.4f}%")
                         
@@ -961,10 +970,9 @@ def main():
                         
                         st.dataframe(fold_df_display, use_container_width=True, hide_index=True)
                         
-# After your existing feature importance display...
                         st.markdown("---")
 
-# Detailed Feature Importance Analysis for Specific Features
+                        # Detailed Feature Importance Analysis for Specific Features
                         target_features = ["hhis", "hhig", "hhic", "hhit", "ccr", "mcr"]
                         final_feature_names = X_all_for_shap.columns.tolist()
 
@@ -974,42 +982,12 @@ def main():
                             target_features
                         )
 
-# Store in session state if you want to use it elsewhere
+                        # Store in session state
                         st.session_state.detailed_importance = detailed_importance_df
-#                         with st.expander("📋 Dataset Preview", expanded=False):
-#                             st.dataframe(df.head(10))
 
-# ADD THE CORRELATION HEATMAP HERE:
+                        # ADD THE CORRELATION HEATMAP HERE:
                         st.markdown("---")
                         create_correlation_heatmap(df)
-
-# Training section (existing code continues...)
-                        st.markdown("---")
-                        st.header("Model Training")
-                        # Feature importance
-#                         st.subheader("🎯 Feature Importance")
-#                         
-#                         col1, col2 = st.columns([2, 1])
-#                         
-#                         with col1:
-#                             # Feature importance plot
-#                             fig = px.bar(
-#                                 feature_importance.head(15), 
-#                                 x='Importance', 
-#                                 y='Feature',
-#                                 orientation='h',
-#                                 title="Top Feature Importance",
-#                                 color='Importance',
-#                                 color_continuous_scale='viridis'
-#                             )
-#                             fig.update_layout(height=600, yaxis={'categoryorder':'total ascending'})
-#                             st.plotly_chart(fig, use_container_width=True)
-#                         
-#                         with col2:
-#                             st.write("**Top Features:**")
-#                             top_features = feature_importance.head(10).copy()
-#                             top_features['Importance'] = top_features['Importance'].apply(lambda x: f"{x:.4f}")
-#                             st.dataframe(top_features, use_container_width=True, hide_index=True)
                         
                         # SHAP Analysis
                         if SHAP_AVAILABLE:
@@ -1070,7 +1048,7 @@ def main():
                         fig.add_trace(go.Scatter(x=folds, y=[r['MSE'] for r in fold_results], 
                                                mode='lines+markers', name='MSE'), row=2, col=2)
                         
-                        fig.update_layout(height=600, showlegend=False)
+                        fig.update_layout(height=600, showlegend=False, title_text="Performance Metrics Across CV Folds")
                         st.plotly_chart(fig, use_container_width=True)
                         
                         # Download results
@@ -1104,22 +1082,23 @@ def main():
                                 "feature_importance.csv",
                                 "text/csv"
                             )
-            
 
             add_mse_trees_analysis_to_main()
 
             # Prediction interface (only show if model is trained)
-            if 'training_model' in st.session_state:
+            if 'training_model' in st.session_state and 'scaler' in st.session_state:
                 st.markdown("---")
                 create_prediction_interface(
-                    st.session_state.training_model, 
+                    st.session_state.training_model,
+                    st.session_state.scaler,  # Pass the scaler
                     st.session_state.df,
                     st.session_state.feature_cols
                 )
                 
                 st.markdown("---")
                 create_csv_predictions(
-                    st.session_state.training_model, 
+                    st.session_state.training_model,
+                    st.session_state.scaler,  # Pass the scaler
                     st.session_state.df,
                     st.session_state.feature_cols
                 )
@@ -1136,11 +1115,22 @@ def main():
         ### 📋 Requirements
         Your CSV file should contain the following columns:
         
-        
         **Target Variable:**
         - `fs` - Target variable (continuous)
         
+        ### 🔧 MinMaxScaler Integration
         
+        **✅ What's New:**
+        - **Automatic Feature Scaling:** All features are automatically scaled to [0,1] range
+        - **User Input Scaling:** When you make predictions, your input values are automatically scaled using the same scaler
+        - **Consistent Scaling:** Both training and prediction use the same scaling parameters
+        - **Visual Feedback:** See before/after scaling for your inputs
+        
+        **🎯 Benefits:**
+        - **Improved Model Performance:** Prevents features with larger scales from dominating
+        - **Better Convergence:** Helps XGBoost converge faster and more reliably  
+        - **Consistent Predictions:** User inputs are scaled the same way as training data
+        - **Robust to Scale Differences:** Works well even with features of very different magnitudes
         
         **🔍 SHAP Analysis:**
         - Get detailed model interpretability insights
@@ -1149,31 +1139,33 @@ def main():
         
         **🎯 Individual Predictions:**
         - Input custom values for all columns
+        - Values automatically scaled before prediction
+        - See scaling transformation applied to your inputs
         - Get instant FS score predictions
-        - See which features are used for training vs. display
         
         **📊 Dataset Predictions:**
-        - Generate predictions for entire dataset
+        - Generate predictions for entire dataset with automatic scaling
         - Compare actual vs predicted FS values
         - Download results with difference calculations
         
         ### 🔧 Hyperparameters (Optimized for Small Datasets)
         
-        - **`n_estimators: 55`** - Number of boosting rounds. Lower value to prevent overfitting on small datasets
-        - **`max_depth: 5`** - Maximum tree depth. Shallow trees reduce complexity for limited data
-        - **`learning_rate: 0.1`** - Step size shrinkage. Standard rate balancing training speed and accuracy
-        - **`subsample: 0.45`** - Fraction of samples used per tree. Low value prevents overfitting with limited rows
-        - **`colsample_bytree: 0.5`** - Fraction of features used per tree. Reduces overfitting and adds regularization
-        - **`reg_alpha: 0.015`** - L1 regularization. Light regularization to prevent overfitting
-        - **`reg_lambda: 1.5`** - L2 regularization. Stronger L2 penalty for model stability on small data
+        - **`n_estimators: 55`** - Number of boosting rounds
+        - **`max_depth: 5`** - Maximum tree depth  
+        - **`learning_rate: 0.1`** - Step size shrinkage
+        - **`subsample: 0.45`** - Fraction of samples used per tree
+        - **`colsample_bytree: 0.5`** - Fraction of features used per tree
+        - **`reg_alpha: 0.015`** - L1 regularization
+        - **`reg_lambda: 1.5`** - L2 regularization
         - **`tree_method: 'hist'`** - Histogram-based algorithm for faster CPU training
         
         ### ⚙️ Model Configuration
-        - **Algorithm:** XGBoost Regressor  
+        - **Algorithm:** XGBoost Regressor with MinMaxScaler
         - **Cross-Validation:** 5-Fold Stratified  
-        - **Feature Importance:** Calculated on all available features  
-        - **SHAP Analysis:** Uses model trained on all features
-        - **Predictions:** Based only on core training features
+        - **Feature Scaling:** MinMaxScaler [0,1] applied to all features
+        - **Feature Importance:** Calculated on scaled features
+        - **SHAP Analysis:** Uses scaled features for interpretation
+        - **Predictions:** Automatic scaling applied to user inputs
         """)
 
 if __name__ == "__main__":
